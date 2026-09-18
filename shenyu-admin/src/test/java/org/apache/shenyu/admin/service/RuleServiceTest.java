@@ -79,6 +79,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -133,10 +135,20 @@ public final class RuleServiceTest {
     public void testDelete() {
         publishEvent();
         RuleDO ruleDO = buildRuleDO("123");
-        given(this.ruleMapper.selectById("123")).willReturn(ruleDO);
         final List<String> ids = Collections.singletonList(ruleDO.getId());
-        given(this.ruleMapper.deleteByIds(ids)).willReturn(ids.size());
+        given(this.ruleMapper.selectByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.singletonList(ruleDO));
+        given(this.ruleMapper.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(ids.size());
         assertEquals(this.ruleService.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID), ids.size());
+        verify(this.ruleConditionMapper).deleteByRuleIds(ids);
+    }
+
+    @Test
+    public void testDeleteWithNoRulesInNamespace() {
+        final List<String> ids = Collections.singletonList("123");
+        given(this.ruleMapper.selectByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.emptyList());
+
+        assertEquals(this.ruleService.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID), 0);
+        verify(this.ruleMapper, never()).deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID);
     }
 
     @Test
@@ -278,8 +290,8 @@ public final class RuleServiceTest {
         testSelectorMergeScenario(
                 new ArrayList<>(Arrays.asList("s1", "s3")),
                 Arrays.asList(selectorDO1, selectorDO2),
-                3,
-                Arrays.asList("s1", "s2", "s3")
+                2,
+                Arrays.asList("s1", "s3")
         );
 
         testSelectorMergeScenario(
@@ -295,6 +307,46 @@ public final class RuleServiceTest {
                 2,
                 Arrays.asList("s1", "s2")
         );
+
+        testSearchByPageWithSpecifiedSelectors();
+        testSearchByPageExpandsNamespaceSelectorsWhenSelectorsEmpty();
+    }
+
+    private void testSearchByPageWithSpecifiedSelectors() {
+        Page<RuleDO> emptyPage = new Page<>();
+        PageCondition<RuleQueryCondition> pageCondition = buildPageCondition();
+        RuleQueryCondition condition = pageCondition.getCondition();
+        List<String> userSelectors = new ArrayList<>(Arrays.asList("s1", "s3"));
+        SelectorDO selectorDO1 = SelectorDO.builder().id("s1").build();
+        SelectorDO selectorDO2 = SelectorDO.builder().id("s2").build();
+        condition.setSelectors(userSelectors);
+
+        given(this.selectorMapper.selectAllByNamespaceId(anyString())).willReturn(Arrays.asList(selectorDO1, selectorDO2));
+        given(this.ruleMapper.selectByCondition(any(RuleQueryCondition.class))).willReturn(emptyPage);
+
+        PageInfo<RuleVO> result = ruleService.searchByPage(pageCondition);
+
+        assertNotNull(result);
+        assertEquals(2, condition.getSelectors().size());
+        assertTrue(condition.getSelectors().containsAll(Arrays.asList("s1", "s3")));
+    }
+
+    private void testSearchByPageExpandsNamespaceSelectorsWhenSelectorsEmpty() {
+        Page<RuleDO> emptyPage = new Page<>();
+        PageCondition<RuleQueryCondition> pageCondition = buildPageCondition();
+        RuleQueryCondition condition = pageCondition.getCondition();
+        SelectorDO selectorDO1 = SelectorDO.builder().id("s1").build();
+        SelectorDO selectorDO2 = SelectorDO.builder().id("s2").build();
+        condition.setSelectors(Collections.emptyList());
+
+        given(this.selectorMapper.selectAllByNamespaceId(anyString())).willReturn(Arrays.asList(selectorDO1, selectorDO2));
+        given(this.ruleMapper.selectByCondition(any(RuleQueryCondition.class))).willReturn(emptyPage);
+
+        PageInfo<RuleVO> result = ruleService.searchByPage(pageCondition);
+
+        assertNotNull(result);
+        assertEquals(2, condition.getSelectors().size());
+        assertTrue(condition.getSelectors().containsAll(Arrays.asList("s1", "s2")));
     }
 
     private void testSelectorMergeScenario(final List<String> userSelectors,

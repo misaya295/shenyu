@@ -111,32 +111,6 @@ services:
       shenyu-integrated-test-combination:
         condition: service_healthy
 
-  shenyu-examples-motan:
-    deploy:
-      resources:
-        limits:
-          memory: 2048M
-    container_name: shenyu-examples-motan
-    image: shenyu-examples-motan:latest
-    restart: always
-    environment:
-      - motan.registry.protocol=zookeeper
-      - motan.registry.address=shenyu-zk:2181
-      - shenyu.register.serverLists=http://shenyu-admin:9095
-    healthcheck:
-      test: [ "CMD-SHELL", "wget -q -O - http://localhost:8081/actuator/health | grep UP || exit 1" ]
-      timeout: 2s
-      retries: 3
-      start_period: 5s
-    ports:
-      - "8081:8081"
-      - "8002:8002"
-    networks:
-      - shenyu
-    depends_on:
-      shenyu-integrated-test-combination:
-        condition: service_healthy
-
   shenyu-examples-sofa:
     deploy:
       resources:
@@ -176,7 +150,9 @@ services:
       - "9095:9095"
     environment:
       - SPRING_PROFILES_ACTIVE=h2
+      - shenyu.sync.websocket.token=shenyu-sync-token
       - shenyu.database.init_script=sql-script/h2/schema.sql
+      - shenyu.jwt.secretKey=shenyu-e2e-jwt-secret-key-2024
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://shenyu-admin:9095/actuator/health | grep UP || exit 1"]
       timeout: 2s
@@ -192,6 +168,7 @@ services:
           memory: 2048M
     environment:
       - shenyu.sync.websocket.urls=ws://shenyu-admin:9095/websocket
+      - shenyu.sync.websocket.token=shenyu-sync-token
     depends_on:
       shenyu-zk:
         condition: service_healthy

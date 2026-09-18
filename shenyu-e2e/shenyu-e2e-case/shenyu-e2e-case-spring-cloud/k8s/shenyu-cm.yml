@@ -241,22 +241,12 @@ data:
           enabled: false
           initialCapacity: 10000 # initial capacity in cache
           maximumSize: 10000 # max size in cache
-        ## selector L2 cache, use trie as L2 cache
-        trie:
-          enabled: false
-          cacheSize: 128 # the number of plug-ins
-          matchMode: antPathMatch
       ruleMatchCache:
         ## rule L1 cache
         cache:
           enabled: true
           initialCapacity: 10000 # initial capacity in cache
           maximumSize: 65536 # max size in cache
-        ## rule L2 cache, use trie as L2 cache
-        trie:
-          enabled: false
-          cacheSize: 1024 # the number of selectors
-          matchMode: antPathMatch
       netty:
         http:
           # set to false, user can custom the netty tcp server config.
@@ -458,6 +448,7 @@ data:
           enabled: true
           messageMaxSize: 10240
           allowOrigins: ws://localhost:9095;ws://localhost:9195;
+          token: shenyu-sync-token
 
   application-admin-sync-http.yml: |
     shenyu:
@@ -499,6 +490,7 @@ data:
       sync:
         websocket:
           urls: ws://shenyu-admin:9095/websocket
+          token: shenyu-sync-token
           allowOrigin: ws://localhost:9195
 
   application-bootstrap-sync-http.yml: |

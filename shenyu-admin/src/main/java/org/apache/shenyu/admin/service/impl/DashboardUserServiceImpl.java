@@ -43,6 +43,7 @@ import org.apache.shenyu.admin.model.vo.LoginDashboardUserVO;
 import org.apache.shenyu.admin.model.vo.RoleVO;
 import org.apache.shenyu.admin.service.DashboardUserService;
 import org.apache.shenyu.admin.service.NamespaceUserService;
+import org.apache.shenyu.admin.service.PasswordHashService;
 import org.apache.shenyu.admin.service.publish.UserEventPublisher;
 import org.apache.shenyu.admin.transfer.DashboardUserTransfer;
 import org.apache.shenyu.admin.utils.Assert;
@@ -52,9 +53,8 @@ import org.apache.shenyu.admin.utils.SessionUtil;
 import org.apache.shenyu.admin.utils.WebI18nAssert;
 import org.apache.shenyu.common.constant.AdminConstants;
 import org.apache.shenyu.common.constant.Constants;
-import org.apache.shenyu.common.utils.AesUtils;
-import org.apache.shenyu.common.utils.DigestUtils;
 import org.apache.shenyu.common.utils.ListUtil;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ldap.NameNotFoundException;
@@ -63,6 +63,14 @@ import org.springframework.ldap.support.LdapEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.Security;
+import java.sql.Timestamp;
+import java.util.Base64;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -76,6 +84,12 @@ import java.util.stream.Collectors;
 public class DashboardUserServiceImpl implements DashboardUserService {
 
     private static final Logger LOG = LoggerFactory.getLogger(DashboardUserServiceImpl.class);
+
+    private static final int AES_BLOCK_SIZE = 16;
+
+    static {
+        Security.addProvider(new BouncyCastleProvider());
+    }
 
     private final DashboardUserMapper dashboardUserMapper;
 
@@ -99,6 +113,8 @@ public class DashboardUserServiceImpl implements DashboardUserService {
 
     private final NamespaceUserService namespaceUserService;
 
+    private final PasswordHashService passwordHashService;
+
     public DashboardUserServiceImpl(final DashboardUserMapper dashboardUserMapper,
                                     final UserRoleMapper userRoleMapper,
                                     final RoleMapper roleMapper,
@@ -108,7 +124,8 @@ public class DashboardUserServiceImpl implements DashboardUserService {
                                     final UserEventPublisher publisher,
                                     final DashboardProperties properties,
                                     final SecretProperties secretProperties,
-                                    final NamespaceUserService namespaceUserService) {
+                                    final NamespaceUserService namespaceUserService,
+                                    final PasswordHashService passwordHashService) {
         this.dashboardUserMapper = dashboardUserMapper;
         this.userRoleMapper = userRoleMapper;
         this.roleMapper = roleMapper;
@@ -119,6 +136,7 @@ public class DashboardUserServiceImpl implements DashboardUserService {
         this.properties = properties;
         this.secretProperties = secretProperties;
         this.namespaceUserService = namespaceUserService;
+        this.passwordHashService = passwordHashService;
     }
 
     /**
@@ -138,6 +156,7 @@ public class DashboardUserServiceImpl implements DashboardUserService {
         Assert.notBlack(dashboardUserDTO.getPassword(), "password is not null");
         Assert.notEmpty(dashboardUserDTO.getRoles(), "role is not empty");
         Assert.isNull(dashboardUserMapper.selectByUserName(dashboardUserDTO.getUserName()), "the user is existed");
+        dashboardUserDTO.setPassword(encodePasswordIfNecessary(dashboardUserDTO.getPassword()));
         DashboardUserDO dashboardUserDO = DashboardUserDO.buildDashboardUserDO(dashboardUserDTO);
         // create new user
         final int insertCount = dashboardUserMapper.insertSelective(dashboardUserDO);
@@ -152,8 +171,11 @@ public class DashboardUserServiceImpl implements DashboardUserService {
 
     @Override
     public int update(final DashboardUserDTO dashboardUserDTO) {
-        // 【mandatory】This function can only be used by the admin user
+        // mandatory: This function can only be used by the admin user
         Assert.isTrue(SessionUtil.isAdmin(), "This function can only be used by the admin(root) user");
+        if (StringUtils.isNotBlank(dashboardUserDTO.getPassword())) {
+            dashboardUserDTO.setPassword(encodePasswordIfNecessary(dashboardUserDTO.getPassword()));
+        }
         DashboardUserDO dashboardUserDO = DashboardUserDO.buildDashboardUserDO(dashboardUserDTO);
         if (Objects.equals(dashboardUserDO.getUserName(), SessionUtil.visitorName())) {
             Assert.isTrue(Boolean.TRUE.equals(dashboardUserDO.getEnabled()), "You cannot disable yourself");
@@ -238,8 +260,10 @@ public class DashboardUserServiceImpl implements DashboardUserService {
      * @param userName user name
      * @param password user password
      * @return {@linkplain DashboardUserVO}
+     * @deprecated use {@link #findByUserName(String)} and {@link PasswordHashService} for authentication.
      */
     @Override
+    @Deprecated
     public DashboardUserVO findByQuery(final String userName, final String password) {
         return DashboardUserVO.buildDashboardUserVO(dashboardUserMapper.findByQuery(userName, password));
     }
@@ -279,12 +303,7 @@ public class DashboardUserServiceImpl implements DashboardUserService {
     @Override
     public LoginDashboardUserVO login(final String userName, final String password, final String clientId) {
         DashboardUserVO dashboardUserVO = null;
-        final String cbcDecryptPassword;
-        if (StringUtils.isNotBlank(secretProperties.getKey()) && StringUtils.isNotBlank(secretProperties.getIv())) {
-            cbcDecryptPassword = AesUtils.cbcDecrypt(secretProperties.getKey(), secretProperties.getIv(), password);
-        } else {
-            cbcDecryptPassword = password;
-        }
+        final String cbcDecryptPassword = resolveLoginPassword(password);
 
         if (Objects.nonNull(ldapTemplate)) {
             dashboardUserVO = loginByLdap(userName, cbcDecryptPassword);
@@ -307,10 +326,46 @@ public class DashboardUserServiceImpl implements DashboardUserService {
                         userDO.setClientId(clientId);
                         dashboardUserMapper.updateSelective(userDO);
                     }
-                    return loginUser.setToken(JwtUtils.generateToken(finalDashboardUserVO.getUserName(), finalDashboardUserVO.getPassword(),
+                    return loginUser.setToken(JwtUtils.generateToken(finalDashboardUserVO.getUserName(), jwtProperties.getSecretKey(),
                             clientId, jwtProperties.getExpiredSeconds())).setExpiredTime(jwtProperties.getExpiredSeconds());
                 })
                 .orElse(null);
+    }
+
+    private String resolveLoginPassword(final String password) {
+        if (StringUtils.isNotBlank(secretProperties.getKey()) && StringUtils.isNotBlank(secretProperties.getIv())
+                && isPotentialEncryptedPassword(password)) {
+            return tryDecryptPassword(password).orElse(password);
+        }
+        return password;
+    }
+
+    private boolean isPotentialEncryptedPassword(final String password) {
+        if (StringUtils.isBlank(password)) {
+            return false;
+        }
+        try {
+            byte[] decoded = Base64.getDecoder().decode(password);
+            return decoded.length > 0 && decoded.length % AES_BLOCK_SIZE == 0;
+        } catch (IllegalArgumentException ignored) {
+            return false;
+        }
+    }
+
+    private Optional<String> tryDecryptPassword(final String password) {
+        byte[] secretKeyBytes = secretProperties.getKey().getBytes(StandardCharsets.UTF_8);
+        byte[] ivBytes = secretProperties.getIv().getBytes(StandardCharsets.UTF_8);
+        try {
+            SecretKey secretKey = new SecretKeySpec(secretKeyBytes, "AES");
+            Cipher cipher = Cipher.getInstance("AES/CBC/Pkcs7Padding");
+            IvParameterSpec ivParameterSpec = new IvParameterSpec(ivBytes);
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec);
+            byte[] decryptedBytes = cipher.doFinal(Base64.getDecoder().decode(password));
+            return Optional.of(new String(decryptedBytes, StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            LOG.debug("AES login password decrypt failed, falling back to plain text password", e);
+            return Optional.empty();
+        }
     }
 
     /**
@@ -324,7 +379,9 @@ public class DashboardUserServiceImpl implements DashboardUserService {
         DashboardUserDO before = dashboardUserMapper.selectById(dashboardUserModifyPasswordDTO.getId());
         Assert.notNull(before, "current user is not found");
         Assert.isTrue(Boolean.TRUE.equals(before.getEnabled()), "current user is locked");
-        Assert.isTrue(Objects.equals(before.getPassword(), dashboardUserModifyPasswordDTO.getOldPassword()), "old password is error");
+        Assert.isTrue(matchesPassword(dashboardUserModifyPasswordDTO.getOldPassword(), before.getPassword()), "old password is error");
+
+        dashboardUserModifyPasswordDTO.setPassword(passwordHashService.encode(dashboardUserModifyPasswordDTO.getPassword()));
 
         DashboardUserDO dashboardUserDO = DashboardUserDO.buildDashboardUserDO(dashboardUserModifyPasswordDTO);
         int updateCount = dashboardUserMapper.updateSelective(dashboardUserDO);
@@ -360,13 +417,15 @@ public class DashboardUserServiceImpl implements DashboardUserService {
                     RoleDO role = roleMapper.findByRoleName("default");
                     DashboardUserDTO dashboardUserDTO = DashboardUserDTO.builder()
                             .userName(userName)
-                            .password(DigestUtils.sha512Hex(password))
+                            .password(passwordHashService.encode(password))
                             .role(1)
                             .roles(Lists.newArrayList(role.getId()))
                             .enabled(true)
                             .build();
                     createOrUpdate(dashboardUserDTO);
                     dashboardUserVO = DashboardUserTransfer.INSTANCE.transferDTO2VO(dashboardUserDTO);
+                } else {
+                    dashboardUserVO = upgradeLegacyPasswordIfNeeded(dashboardUserVO, password);
                 }
             }
             return dashboardUserVO;
@@ -379,7 +438,44 @@ public class DashboardUserServiceImpl implements DashboardUserService {
     }
 
     private DashboardUserVO loginByDatabase(final String userName, final String password) {
-        return findByQuery(userName, DigestUtils.sha512Hex(password));
+        DashboardUserVO dashboardUserVO = findByUserName(userName);
+        if (Objects.isNull(dashboardUserVO)) {
+            return null;
+        }
+        if (passwordHashService.matches(password, dashboardUserVO.getPassword())) {
+            return dashboardUserVO;
+        }
+        if (passwordHashService.matchesLegacySha512(password, dashboardUserVO.getPassword())) {
+            return upgradeLegacyPasswordIfNeeded(dashboardUserVO, password);
+        }
+        return null;
+    }
+
+    private String encodePasswordIfNecessary(final String password) {
+        if (passwordHashService.isBcryptHash(password)) {
+            return password;
+        }
+        return passwordHashService.encode(password);
+    }
+
+    private DashboardUserVO upgradeLegacyPasswordIfNeeded(final DashboardUserVO dashboardUserVO, final String password) {
+        if (Objects.isNull(dashboardUserVO) || !passwordHashService.matchesLegacySha512(password, dashboardUserVO.getPassword())) {
+            return dashboardUserVO;
+        }
+        String encodedPassword = passwordHashService.encode(password);
+        DashboardUserDO dashboardUserDO = DashboardUserDO.builder()
+                .id(dashboardUserVO.getId())
+                .password(encodedPassword)
+                .dateUpdated(new Timestamp(System.currentTimeMillis()))
+                .build();
+        dashboardUserMapper.updateSelective(dashboardUserDO);
+        dashboardUserVO.setPassword(encodedPassword);
+        return dashboardUserVO;
+    }
+
+    private boolean matchesPassword(final String rawPassword, final String storedPasswordHash) {
+        return passwordHashService.matches(rawPassword, storedPasswordHash)
+                || passwordHashService.matchesLegacySha512(rawPassword, storedPasswordHash);
     }
 
     /**
